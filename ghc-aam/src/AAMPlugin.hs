@@ -1,6 +1,15 @@
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+
 module AAMPlugin (plugin) where
 import GhcPlugins
+import CorePrep
+import CoreSyn
+import FamInstEnv
 import qualified Data.Map as Map
+import Data.Generics
 
 plugin :: Plugin
 plugin = defaultPlugin {
@@ -22,83 +31,159 @@ pass guts = do dflags <- getDynFlags
              return bndr
            printBind _ bndr = return bndr
 
+--deriving instance Data SafeHaskellMode
+--deriving instance Data ModGuts
+
+--convertIntegers :: DynFlags -> Id -> Maybe DataCon -> ModGuts -> ModGuts
+--convertIntegers dflags x dc = everywhere f where
+--    f :: CoreExpr -> CoreExpr
+--    f (Lit (LitInteger i t)) = cvtLitInteger dflags x dc i
+--    f x = x
+
+{-
+Thunks
+
+App create a thunk for the entire application
+
+
+-}
+
+--type Code b = Expr b
+
 -- Types and things
 
-data Primitave
-    = ...
+sDocToString :: Outputable a => a -> String
+sDocToString = showSDocUnsafe . ppr
 
-data Value
-    = LitVal Lit
-    | Clo Env Var (Exp Var)
-    | Con ConName [Value]
-    | Prim Primative
-    | Type Type
+instance Show (CoreExpr) where
+    show = sDocToString
 
-data Thunk
-    = AppT Env (Code b) (Code b)
-
--- Rewritten for ease of writing
-data Expr b
-    = Var Id
-    | Lit Literal
-    | App (Expr b) (Expr b)
-    | Lam b (Expr b)
-    | Let (Bind b) (Expr b)
-    | Case (Expr b) b Type [Alt b]
-    | Cast (Expr b) Coercion
-    | Tick (Tickish Id) (Expr b)
-    | Type Type
-    | Coercion Coercion
-
-type Code b = Expr b
-
-data Kont
-    = App0K
-    | CaseK Value Type [Alt]
-    | NonRecK ... (Code b)
-    | CastK
+instance Show CoreBndr where
+    show = sDocToString
 
 type Address = Int
 
-type Env = Map.Map Id Address
+type Env = Map.Map CoreBndr Address
+
+data HeapValue
+    = Clo Env CoreBndr CoreExpr
+    | Con CoreBndr [HeapValue]
+    | Thunk Env CoreExpr
+    deriving (Show)
+
+--instance (Outputable a) => Show a where
+--    show = showSDocUnsafe . ppr
 
 -- rewrite to contain an address pointer
-type Store = Map.Map Address Value
+type Store = Map.Map Address HeapValue
+
+-- addr -> *next* free address to be used (not the address most recently used)
+data StoreTup = StoreTup {store :: Store, addr :: Address}
+
+next_addr :: Address -> Address
+next_addr = (+ 1)
+
+store_alloc :: HeapValue -> StoreTup -> StoreTup
+store_alloc v (StoreTup s a) = StoreTup (Map.insert a v s) (next_addr a)
+
+store_lookup :: Store -> Address -> HeapValue
+store_lookup s a = case Map.lookup a s of
+    Nothing -> error ("No match for Address: " ++ (show a) ++ " in store: " ++ (show s))
+    Just hv -> hv
+
+env_extend :: CoreBndr -> Address -> Env -> Env
+env_extend = Map.insert
+
+env_lookup :: Env -> CoreBndr -> Address
+env_lookup e name = case Map.lookup name e of
+    Nothing -> error ("No match for Id: " ++ (show name) ++ " in environment: " ++ (show e))
+    Just a -> a
+
+data Value
+    = HeapValue Address -- change to StoreAddress?
+    | ImValue Literal
+    | ImTuple [Value]
+    | TypeValue Type
+    | CoerceValue Coercion
+
+data Kont
+    = App1K Env (CoreExpr)
+    | CaseK CoreBndr Type [CoreAlt]
+    | CastK Coercion
+    | TickK (Tickish Id)
 
 data State
-    = Return Address Store [Kont]
-    | Evaluate (Code b) Env Store [Kont]
+    = Return Value StoreTup [Kont]
+    | Evaluate (CoreExpr) Env StoreTup [Kont]
 
 step :: State -> State
-step (Return a s k) = ret s k v
-step (Evaluate c env s k) = eval env s k c 
+step (Return v s (k : ks)) = ret v s ks k
+step (Evaluate c env s ks) = eval env s ks c
 
-ret :: Store -> Kont -> Value -> State
-ret s k v = case k of
-    App0K env a:k')
-        -> Evaluate (a env s (App1K env (v:k')))
-    App1K env f@(Clo env' x body):k')
-        -> ...
+ret :: Value -> StoreTup -> [Kont] -> Kont -> State
+ret v s ks k = case k of
+    App1K env arg ->
+        -- Need to evaluate the argument of a function application.
+        Evaluate arg env s ks
 
-eval :: Env -> Store -> Kont -> Code -> State
-eval s k c = case c of
-    Var x
-        -> Return (env_lookup x env) s k
-    Lit l
-        -> Return (store (LitVal l)) s k
-    App f a
-        -> Evaluate f env s (App0K a : k)
-    Lam x body
-        -> Return (store (Clo env x body)) s k
-    Case e0 v t alts
-        -> Evaluate e env s (CaseK v t alts : k)
-    Let (NonRec x e0) body
-        -> Evaluate c env s (NonRecK x body : k)
-    Let (Rec bndrs) body
-        -> 
-    Cast e0 co
-        -> Evaluate c env s (CastK co : k)
-    Type t
-        -> Return (store (Type t)) s k
-    Coercion c
-        -> error "AAMPlugin.eval.Coercion: No coercion case defined."
+eval :: Env -> StoreTup -> [Kont] -> CoreExpr -> State
+eval env sto ks c = case c of
+    Var x ->
+        -- Look up the variable in the current environment.
+        Return (HeapValue (env_lookup env x)) sto ks
+    Lit l ->
+        -- We assume there are no non-immediate literals.
+        Return (ImValue l) sto ks
+    App f a ->
+        -- Wrap application in a Thunk; evaluate function.
+        Evaluate f env sto (App1K env a : ks)
+    Lam x body ->
+        -- Create a closure.
+        Return (HeapValue (addr sto)) (store_alloc (Clo env x body) sto) ks
+    Case e v t alts ->
+        -- Evaluate the type and the scrutiny of the case.
+        Evaluate e env sto (CaseK v (evalType env t) alts : ks)
+    Let (NonRec x e) body ->
+        Evaluate body env' sto' ks where
+            (env', sto') = evalBndrs env env sto [(x, e)]
+--        Evaluate body (env_extend x v e) s' ks where
+--            (v, s') = evalLazy env sto e0
+    Let (Rec bndrs) body ->
+        Evaluate body env' sto' ks where
+            (env', sto') = evalBndrs env env' sto bndrs
+
+--            let state = go env sto bndrs
+--                env = case state of Evaluate _ env _ _ -> env
+--                go = ... env ...
+    Cast e co ->
+        -- Evaluate the body of the cast as well as the coercion..
+        Evaluate e env sto (CastK (evalCoer env co) : ks)
+    Tick t e ->
+        -- Continue evaluation without dealing with the Tickish Id.
+        Evaluate e env sto (TickK t : ks)
+    Type ty ->
+        -- Evaluate inside the Type.
+        Return (TypeValue (evalType env ty)) sto ks
+    Coercion co ->
+        -- Evaluate inside the Coercion.
+        Return (CoerceValue (evalCoer env co)) sto ks
+
+{-
+The second environment taken is used to update the evaluation after the recursion completes; this implementation depends
+on Haskell's laziness to compute the result properly.
+-}
+evalBndrs :: Env -> Env -> StoreTup -> [(CoreBndr, CoreExpr)] -> (Env, StoreTup)
+evalBndrs env _ sto [] = (env, sto)
+evalBndrs env env' sto ((x, e) : bs) = evalBndrs (env_extend x v env) env' sto' bs where
+    (v, sto') = evalLazy env' sto e
+
+evalLazy :: Env -> StoreTup -> CoreExpr -> (Value, StoreTup)
+evalLazy e s (Var x) = ((HeapValue (env_lookup e x)), s)
+evalLazy _ s (Lit l) = (ImValue l, s)
+evalLazy e s expr = (HeapValue (addr s), (store_alloc (Thunk e expr) s))
+
+evalType :: Env -> Type -> Type
+evalType e t = error ""
+
+evalCoer :: Env -> Coercion -> Coercion
+evalCoer e c = error ""

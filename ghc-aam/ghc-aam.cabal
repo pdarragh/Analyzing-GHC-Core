@@ -15,9 +15,11 @@ cabal-version:       >=1.10
 
 library
   hs-source-dirs:      src
-  exposed-modules:     SayNamesPlugin
+  exposed-modules:     AAMPlugin
   build-depends:       base >= 4.7 && < 5
                      , ghc
+                     , containers
+                     , syb
   default-language:    Haskell2010
 
 executable ghc-aam-exe
