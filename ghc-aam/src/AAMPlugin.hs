@@ -63,13 +63,17 @@ instance Show CoreBndr where
 
 type Address = Int
 
-type Env = Map.Map CoreBndr Address
+type Env = Map.Map CoreBndr Value
 
 data HeapValue
     = Clo Env CoreBndr CoreExpr
     | Con CoreBndr [HeapValue]
     | Thunk Env CoreExpr
     deriving (Show)
+
+-- TODO: Actually implement this.
+instance Show Value where
+    show v = ""
 
 --instance (Outputable a) => Show a where
 --    show = showSDocUnsafe . ppr
@@ -91,13 +95,13 @@ store_lookup s a = case Map.lookup a s of
     Nothing -> error ("No match for Address: " ++ (show a) ++ " in store: " ++ (show s))
     Just hv -> hv
 
-env_extend :: CoreBndr -> Address -> Env -> Env
+env_extend :: CoreBndr -> Value -> Env -> Env
 env_extend = Map.insert
 
-env_lookup :: Env -> CoreBndr -> Address
-env_lookup e name = case Map.lookup name e of
-    Nothing -> error ("No match for Id: " ++ (show name) ++ " in environment: " ++ (show e))
-    Just a -> a
+env_lookup :: Env -> CoreBndr -> Value
+env_lookup env name = case Map.lookup name env of
+    Nothing -> error ("No match for Id: " ++ (show name) ++ " in environment: " ++ (show env))
+    Just v -> v
 
 data Value
     = HeapValue Address -- change to StoreAddress?
@@ -117,20 +121,20 @@ data State
     | Evaluate (CoreExpr) Env StoreTup [Kont]
 
 step :: State -> State
-step (Return v s (k : ks)) = ret v s ks k
-step (Evaluate c env s ks) = eval env s ks c
+step (Return v sto (k : ks)) = ret v sto ks k
+step (Evaluate c env sto ks) = eval env sto ks c
 
 ret :: Value -> StoreTup -> [Kont] -> Kont -> State
-ret v s ks k = case k of
+ret v sto ks k = case k of
     App1K env arg ->
         -- Need to evaluate the argument of a function application.
-        Evaluate arg env s ks
+        Evaluate arg env sto ks
 
 eval :: Env -> StoreTup -> [Kont] -> CoreExpr -> State
 eval env sto ks c = case c of
     Var x ->
         -- Look up the variable in the current environment.
-        Return (HeapValue (env_lookup env x)) sto ks
+        Return (env_lookup env x) sto ks
     Lit l ->
         -- We assume there are no non-immediate literals.
         Return (ImValue l) sto ks
@@ -178,7 +182,7 @@ evalBndrs env env' sto ((x, e) : bs) = evalBndrs (env_extend x v env) env' sto' 
     (v, sto') = evalLazy env' sto e
 
 evalLazy :: Env -> StoreTup -> CoreExpr -> (Value, StoreTup)
-evalLazy e s (Var x) = ((HeapValue (env_lookup e x)), s)
+evalLazy e s (Var x) = ((env_lookup e x), s)
 evalLazy _ s (Lit l) = (ImValue l, s)
 evalLazy e s expr = (HeapValue (addr s), (store_alloc (Thunk e expr) s))
 
