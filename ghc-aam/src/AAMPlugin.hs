@@ -6,10 +6,7 @@
 module AAMPlugin (plugin) where
 import GhcPlugins
 import CorePrep
-import CoreSyn
-import FamInstEnv
 import qualified Data.Map as Map
-import Data.Generics
 
 plugin :: Plugin
 plugin = defaultPlugin {
@@ -23,7 +20,12 @@ install _ todos = do
 
 pass :: ModGuts -> CoreM ModGuts
 pass guts = do dflags <- getDynFlags
-               bindsOnlyPass (mapM (printBind dflags)) guts
+               hsc_env <- getHscEnv
+               mkIntegerId <- liftIO (lookupMkIntegerName dflags hsc_env)
+               integerSDataCon <- liftIO (lookupIntegerSDataConName dflags hsc_env)
+               newModGuts <- bindsOnlyPass (mapM (printBind dflags)) guts
+               _ <- bindsOnlyPass (mapM (printBind dflags)) (convertIntegers dflags mkIntegerId integerSDataCon guts)
+               return newModGuts
      where printBind :: DynFlags -> CoreBind -> CoreM CoreBind
            printBind dflags bndr@(NonRec b v) = do
              putMsgS $ "Non-recurisve binding named " ++ showSDoc dflags (ppr b)
@@ -31,26 +33,26 @@ pass guts = do dflags <- getDynFlags
              return bndr
            printBind _ bndr = return bndr
 
---deriving instance Data SafeHaskellMode
---deriving instance Data ModGuts
-
---convertIntegers :: DynFlags -> Id -> Maybe DataCon -> ModGuts -> ModGuts
---convertIntegers dflags x dc = everywhere f where
---    f :: CoreExpr -> CoreExpr
---    f (Lit (LitInteger i t)) = cvtLitInteger dflags x dc i
---    f x = x
-
-{-
-Thunks
-
-App create a thunk for the entire application
-
-
--}
-
---type Code b = Expr b
-
--- Types and things
+convertIntegers :: DynFlags -> Id -> Maybe DataCon -> ModGuts -> ModGuts
+convertIntegers dflags name mdc = modGuts where
+    modGuts m = m { mg_binds = coreProgram (mg_binds m) }
+    coreProgram = map coreBind
+    coreBind (NonRec x e) = NonRec x (exp e)
+    coreBind (Rec bndrs) = Rec (map bndr bndrs)
+    bndr (x, e) = (x, exp e)
+    exp (Var x) = Var x
+    exp (Lit (LitInteger i t)) = cvtLitInteger dflags name mdc i
+    exp (Lit l) = Lit l
+    exp (App f a) = App (exp f) (exp a)
+    exp (Lam x body) = Lam x (exp body)
+    exp (Case e v t a) = Case (exp e) v t (alts a)
+    exp (Let b body) = Let (coreBind b) (exp body)
+    exp (Cast e co) = Cast (exp e) co
+    exp (Tick t e) = Tick t (exp e)
+    exp (Type ty) = Type ty
+    exp (Coercion co) = Coercion co
+    alts = map alt
+    alt (ac, bs, e) = (ac, bs, (exp e))
 
 sDocToString :: Outputable a => a -> String
 sDocToString = showSDocUnsafe . ppr
@@ -73,7 +75,7 @@ data HeapValue
 
 -- TODO: Actually implement this.
 instance Show Value where
-    show v = ""
+    show v = error "value"
 
 --instance (Outputable a) => Show a where
 --    show = showSDocUnsafe . ppr
@@ -129,6 +131,12 @@ ret v sto ks k = case k of
     App1K env arg ->
         -- Need to evaluate the argument of a function application.
         Evaluate arg env sto ks
+    CaseK bndr ty alts ->
+        error "ret CaseK"
+    CastK co ->
+        error "ret CastK"
+    TickK ti ->
+        error "ret TickK"
 
 eval :: Env -> StoreTup -> [Kont] -> CoreExpr -> State
 eval env sto ks c = case c of
@@ -187,7 +195,7 @@ evalLazy _ s (Lit l) = (ImValue l, s)
 evalLazy e s expr = (HeapValue (addr s), (store_alloc (Thunk e expr) s))
 
 evalType :: Env -> Type -> Type
-evalType e t = error ""
+evalType e t = error "evalType"
 
 evalCoer :: Env -> Coercion -> Coercion
-evalCoer e c = error ""
+evalCoer e c = error "evalCoer"
