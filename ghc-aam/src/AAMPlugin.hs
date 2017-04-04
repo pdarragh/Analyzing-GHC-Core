@@ -6,6 +6,7 @@
 module AAMPlugin (plugin) where
 import GhcPlugins
 import CorePrep
+import TyCoRep
 import qualified Data.Map as Map
 
 plugin :: Plugin
@@ -63,13 +64,16 @@ instance Show (CoreExpr) where
 instance Show CoreBndr where
     show = sDocToString
 
+instance Show DataCon where
+    show = error "No Show instance for DataCon."
+
 type Address = Int
 
 type Env = Map.Map CoreBndr Value
 
 data HeapValue
     = Clo Env CoreBndr CoreExpr
-    | Con CoreBndr [HeapValue]
+    | Con DataCon [Value]
     | Thunk Env CoreExpr
     deriving (Show)
 
@@ -105,6 +109,9 @@ env_lookup env name = case Map.lookup name env of
     Nothing -> error ("No match for Id: " ++ (show name) ++ " in environment: " ++ (show env))
     Just v -> v
 
+env_lookup_maybe :: Env -> CoreBndr -> Maybe Value
+env_lookup_maybe = flip Map.lookup
+
 data Value
     = HeapValue Address -- change to StoreAddress?
     | ImValue Literal
@@ -113,15 +120,16 @@ data Value
     | CoerceValue Coercion
 
 data Kont
-    = App1K Env (CoreExpr)
-    | CaseK CoreBndr Type [CoreAlt]
+    = App1K Env CoreExpr
+    | CaseK Env CoreBndr Type [CoreAlt]
     | CastK Coercion
     | TickK (Tickish Id)
 
 data State
     = Return Value StoreTup [Kont]
-    | Evaluate (CoreExpr) Env StoreTup [Kont]
+    | Evaluate CoreExpr Env StoreTup [Kont]
 
+-- TODO: Call this. Be careful of initial environment (needs to contain all top-level bindings).
 step :: State -> State
 step (Return v sto (k : ks)) = ret v sto ks k
 step (Evaluate c env sto ks) = eval env sto ks c
@@ -129,14 +137,55 @@ step (Evaluate c env sto ks) = eval env sto ks c
 ret :: Value -> StoreTup -> [Kont] -> Kont -> State
 ret v sto ks k = case k of
     App1K env arg ->
-        -- Need to evaluate the argument of a function application.
-        Evaluate arg env sto ks
-    CaseK bndr ty alts ->
-        error "ret CaseK"
-    CastK co ->
-        error "ret CastK"
-    TickK ti ->
-        error "ret TickK"
+        case v of
+            HeapValue a ->
+                 case (store_lookup (store sto) a) of
+                    (Clo clo_env name body) -> Evaluate body env' sto' ks where
+                        env' = env_extend name (HeapValue (addr sto)) clo_env
+                        sto' = store_alloc (Thunk env arg) sto
+                    _ -> error "Function position of application was not a closure."
+            _ -> error "Function position of application was not a HeapValue."
+    CaseK env bndr ty alts
+        | HeapValue a <- v -> case (store_lookup (store sto) a) of
+            Con dc vs -> last [g bs e | (ac, bs, e) <- alts, f ac] where
+                f :: AltCon -> Bool
+                f (DataAlt dc') = dc == dc'
+                f (LitAlt _) = False
+                f DEFAULT = True
+                g :: [CoreBndr] -> CoreExpr -> State
+                g bs e = Evaluate e env' sto ks where
+                    env' = foldr q (env_extend bndr v env) (zip bs vs)
+                    q :: (CoreBndr, Value) -> Env -> Env
+--                    q (b, v') = env_extend b v'
+                    q = uncurry env_extend
+            _ -> error "Non-constructor in scrutiny of a case expecting a constructor."
+        | ImValue l <- v -> let
+            f :: AltCon -> Bool
+            f (DataAlt _) = False
+            f (LitAlt l') = l == l'
+            f DEFAULT = True
+            g :: [CoreBndr] -> CoreExpr -> State
+            g _ e = Evaluate e (env_extend bndr v env) sto ks
+            in last [g bs e | (ac, bs, e) <- alts, f ac]
+        | ImTuple vs <- v -> let
+            f :: AltCon -> Bool
+            f (DataAlt _) = True  -- TODO: Explain.
+            f (LitAlt _) = False
+            f DEFAULT = True
+            g :: [CoreBndr] -> CoreExpr -> State
+            g bs e = Evaluate e env' sto ks where
+                env' = foldr q (env_extend bndr v env) (zip bs vs)
+                q :: (CoreBndr, Value) -> Env -> Env
+                q = uncurry env_extend
+            in last [g bs e | (ac, bs, e) <- alts, f ac]
+        | TypeValue _ <- v -> error "TypeValue in scrutiny of a case."
+        | CoerceValue _ <- v -> error "CoerceValue in scrutiny of a case."
+    CastK _ ->
+        -- Ignore Casts.
+        Return v sto ks
+    TickK _ ->
+        -- Ignore Ticks.
+        Return v sto ks
 
 eval :: Env -> StoreTup -> [Kont] -> CoreExpr -> State
 eval env sto ks c = case c of
@@ -154,19 +203,13 @@ eval env sto ks c = case c of
         Return (HeapValue (addr sto)) (store_alloc (Clo env x body) sto) ks
     Case e v t alts ->
         -- Evaluate the type and the scrutiny of the case.
-        Evaluate e env sto (CaseK v (evalType env t) alts : ks)
+        Evaluate e env sto (CaseK env v (evalType env t) alts : ks)
     Let (NonRec x e) body ->
         Evaluate body env' sto' ks where
             (env', sto') = evalBndrs env env sto [(x, e)]
---        Evaluate body (env_extend x v e) s' ks where
---            (v, s') = evalLazy env sto e0
     Let (Rec bndrs) body ->
         Evaluate body env' sto' ks where
             (env', sto') = evalBndrs env env' sto bndrs
-
---            let state = go env sto bndrs
---                env = case state of Evaluate _ env _ _ -> env
---                go = ... env ...
     Cast e co ->
         -- Evaluate the body of the cast as well as the coercion..
         Evaluate e env sto (CastK (evalCoer env co) : ks)
@@ -195,7 +238,18 @@ evalLazy _ s (Lit l) = (ImValue l, s)
 evalLazy e s expr = (HeapValue (addr s), (store_alloc (Thunk e expr) s))
 
 evalType :: Env -> Type -> Type
-evalType e t = error "evalType"
+evalType env (TyVarTy v) = case (env_lookup_maybe env v) of
+    Just (TypeValue t) -> t
+    Just _ -> error "Failed type lookup."
+    Nothing -> TyVarTy v
+evalType env (AppTy t1 t2) = AppTy (evalType env t1) (evalType env t2)
+evalType env (TyConApp tc kots) = TyConApp tc (map (evalType env) kots)
+evalType env (ForAllTy (Named tv vf) t) = ForAllTy (Named tv vf) (evalType (Map.delete tv env) t)
+evalType env (ForAllTy (Anon t1) t2) = ForAllTy (Anon (evalType env t1)) (evalType env t2)
+evalType env (LitTy tl) = LitTy tl
+evalType env (CastTy t kc) = CastTy (evalType env t) kc
+evalType env (CoercionTy co) = CoercionTy co
 
+-- TODO: Check that there are no expressions or types in here that need to be evaluated.
 evalCoer :: Env -> Coercion -> Coercion
-evalCoer e c = error "evalCoer"
+evalCoer e c = c
