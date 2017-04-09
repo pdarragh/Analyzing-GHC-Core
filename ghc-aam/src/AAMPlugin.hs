@@ -7,6 +7,7 @@ module AAMPlugin (plugin) where
 import GhcPlugins
 import CorePrep
 import TyCoRep
+import Data.List (intercalate)
 import qualified Data.Map as Map
 
 plugin :: Plugin
@@ -77,10 +78,6 @@ data HeapValue
     | Thunk Env CoreExpr
     deriving (Show)
 
--- TODO: Actually implement this.
-instance Show Value where
-    show v = error "value"
-
 --instance (Outputable a) => Show a where
 --    show = showSDocUnsafe . ppr
 
@@ -118,6 +115,13 @@ data Value
     | ImTuple [Value]
     | TypeValue Type
     | CoerceValue Coercion
+
+instance Show Value where
+    show (HeapValue a) = "HeapValue: " ++ (show a)
+    show (ImValue l) = "ImValue: " ++ (sDocToString l)
+    show (ImTuple vs) = "ImTuple: " ++ "(" ++ (intercalate "," (map show vs)) ++ ")"
+    show (TypeValue t) = "Type: " ++ (sDocToString t)
+    show (CoerceValue co) = "Coercion: " ++ (sDocToString co)
 
 data Kont
     = App1K Env CoreExpr
