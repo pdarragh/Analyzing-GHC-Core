@@ -25,7 +25,15 @@ pass guts = do dflags <- getDynFlags
                hsc_env <- getHscEnv
                mkIntegerId <- liftIO (lookupMkIntegerName dflags hsc_env)
                integerSDataCon <- liftIO (lookupIntegerSDataConName dflags hsc_env)
+               -- Print all the bindings first.
+               putMsgS "****************************************"
+               putMsgS "Printing bindings"
+               putMsgS "****************************************"
                newModGuts <- bindsOnlyPass (mapM (printBind dflags)) guts
+               putMsgS "****************************************"
+               putMsgS "Converting integers"
+               putMsgS "****************************************"
+               -- Then convert all the integers to immediates and print the bindings.
                _ <- bindsOnlyPass (mapM (printBind dflags)) (convertIntegers dflags mkIntegerId integerSDataCon guts)
                return newModGuts
      where printBind :: DynFlags -> CoreBind -> CoreM CoreBind
