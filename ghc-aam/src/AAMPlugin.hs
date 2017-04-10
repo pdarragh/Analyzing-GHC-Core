@@ -21,27 +21,29 @@ install _ todos = do
     return (CoreDoPluginPass "Say Name" pass : todos)
 
 pass :: ModGuts -> CoreM ModGuts
-pass guts = do dflags <- getDynFlags
-               hsc_env <- getHscEnv
-               mkIntegerId <- liftIO (lookupMkIntegerName dflags hsc_env)
-               integerSDataCon <- liftIO (lookupIntegerSDataConName dflags hsc_env)
-               -- Print all the bindings first.
-               putMsgS "****************************************"
-               putMsgS "Printing bindings"
-               putMsgS "****************************************"
-               newModGuts <- bindsOnlyPass (mapM (printBind dflags)) guts
-               putMsgS "****************************************"
-               putMsgS "Converting integers"
-               putMsgS "****************************************"
-               -- Then convert all the integers to immediates and print the bindings.
-               _ <- bindsOnlyPass (mapM (printBind dflags)) (convertIntegers dflags mkIntegerId integerSDataCon guts)
-               return newModGuts
-     where printBind :: DynFlags -> CoreBind -> CoreM CoreBind
-           printBind dflags bndr@(NonRec b v) = do
-             putMsgS $ "Non-recurisve binding named " ++ showSDoc dflags (ppr b)
-             putMsgS $ "Binding: " ++ showSDoc dflags (ppr v)
-             return bndr
-           printBind _ bndr = return bndr
+pass guts = do
+    dflags <- getDynFlags
+    hsc_env <- getHscEnv
+    mkIntegerId <- liftIO (lookupMkIntegerName dflags hsc_env)
+    integerSDataCon <- liftIO (lookupIntegerSDataConName dflags hsc_env)
+    -- Print all the bindings first.
+    putMsgS "****************************************"
+    putMsgS "Printing bindings"
+    putMsgS "****************************************"
+    _ <- bindsOnlyPass (mapM (printBind dflags)) guts
+    -- Then convert all the integers to immediates and print the bindings.
+    putMsgS "****************************************"
+    putMsgS "Converting integers"
+    putMsgS "****************************************"
+    _ <- bindsOnlyPass (mapM (printBind dflags)) (convertIntegers dflags mkIntegerId integerSDataCon guts)
+    -- Return the original ModGuts.
+    return guts where
+        printBind :: DynFlags -> CoreBind -> CoreM CoreBind
+        printBind dflags bndr@(NonRec b v) = do
+            putMsgS $ "Non-recurisve binding named " ++ showSDoc dflags (ppr b)
+            putMsgS $ "Binding: " ++ showSDoc dflags (ppr v)
+            return bndr
+        printBind _ bndr = return bndr
 
 convertIntegers :: DynFlags -> Id -> Maybe DataCon -> ModGuts -> ModGuts
 convertIntegers dflags name mdc = modGuts where
