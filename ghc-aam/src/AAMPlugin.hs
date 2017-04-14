@@ -2,6 +2,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE BangPatterns #-}
 
 module AAMPlugin (plugin) where
 import GhcPlugins
@@ -16,12 +17,12 @@ plugin = defaultPlugin {
 }
 
 install :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
-install _ todos = do
+install opts todos = do
     reinitializeGlobals
-    return (CoreDoPluginPass "Say Name" pass : todos)
+    return (CoreDoPluginPass "Say Name" (pass opts) : todos)
 
-pass :: ModGuts -> CoreM ModGuts
-pass guts = do
+pass :: [CommandLineOption] -> ModGuts -> CoreM ModGuts
+pass opts guts = do
     dflags <- getDynFlags
     hsc_env <- getHscEnv
     mkIntegerId <- liftIO (lookupMkIntegerName dflags hsc_env)
@@ -35,7 +36,21 @@ pass guts = do
     putMsgS "****************************************"
     putMsgS "Converting integers"
     putMsgS "****************************************"
-    _ <- bindsOnlyPass (mapM (printBind dflags)) (convertIntegers dflags mkIntegerId integerSDataCon guts)
+    intGuts <- bindsOnlyPass (mapM (printBind dflags)) (convertIntegers dflags mkIntegerId integerSDataCon guts)
+    -- Process the bindings out of the intGuts and put the CoreExprs into a new store.
+    let (env, sto) = foldr (buildThunks env) (new_env, new_store) (unwrapBinds (mg_binds intGuts))
+    -- Assume each CommandLineOption is the name of a binding to investigate.
+    -- Compare each CommandLineOption to the bindings in the environment. If there's a match, run the interpreter.
+    let addresses = map (getAddresses env) opts
+    let exprs = map (getExprs sto) addresses
+    putMsgS "****************************************"
+    putMsgS "Evaluating program"
+    putMsgS "****************************************"
+    let ! results = map (interp sto) exprs
+    putMsgS "****************************************"
+    putMsgS "Outputting results"
+    putMsgS "****************************************"
+    mapM_ putMsgS (map resultToString results)
     -- Return the original ModGuts.
     return guts where
         printBind :: DynFlags -> CoreBind -> CoreM CoreBind
@@ -44,6 +59,47 @@ pass guts = do
             putMsgS $ "Binding: " ++ showSDoc dflags (ppr v)
             return bndr
         printBind _ bndr = return bndr
+
+unwrapBinds :: [CoreBind] -> [(CoreBndr, CoreExpr)]
+unwrapBinds = concatMap unwrapBind
+
+unwrapBind :: CoreBind -> [(CoreBndr, CoreExpr)]
+unwrapBind (NonRec b e) = [(b, e)]
+unwrapBind (Rec binds) = binds
+
+-- Use this with a foldr.
+-- Wrap all the top-level bindings into Thunks with empty environments for later evaluation.
+buildThunks :: Env -> (CoreBndr, CoreExpr) -> (Env, StoreTup) -> (Env, StoreTup)
+buildThunks env' (b, e) (env, s) = ((env_extend b (HeapValue (addr s)) env), (store_alloc (Thunk env' e) s))
+
+getAddresses :: Env -> CommandLineOption -> Address
+getAddresses env name = case [(n, v) | (n, v) <- Map.toList env, name == nameToString n] of
+    [(_, v)] -> case v of
+        HeapValue a -> a
+        _ -> error "getAddresses: not a HeapValue"
+    [] -> error $ "getAddresses: no binding named: " ++ name ++ " in bindings: " ++ (intercalate ", " (map (nameToString . fst) (Map.toList env)))
+    vs -> error $ "getAddresses: too many bindings named: " ++ name ++ " : " ++ (intercalate ", " (map (show . fst) vs))
+
+nameToString :: NamedThing a => a -> String
+nameToString = unpackFS . occNameFS . getOccName
+
+getExprs :: StoreTup -> Address -> (Env, CoreExpr)
+getExprs (StoreTup s _) a = case store_lookup s a of
+    Thunk env expr -> (env, expr)
+    _ -> error "invalid value in store"
+
+interp :: StoreTup -> (Env, CoreExpr) -> Result
+interp s (env, e) = interp' (Right (Evaluate e env s []))
+
+interp' :: Either Result State -> Result
+interp' (Left res) = res
+interp' (Right s) = interp' (step s)
+
+resultToString :: Result -> String
+resultToString (Result v st) = "value: " ++ show v ++ "\n" ++ "store: " ++ storeToString st
+
+storeToString :: StoreTup -> String
+storeToString (StoreTup s a) = "next address: " ++ show a ++ "\n" ++ (unlines (map show (Map.toList s)))
 
 convertIntegers :: DynFlags -> Id -> Maybe DataCon -> ModGuts -> ModGuts
 convertIntegers dflags name mdc = modGuts where
@@ -97,6 +153,9 @@ type Store = Map.Map Address HeapValue
 -- addr -> *next* free address to be used (not the address most recently used)
 data StoreTup = StoreTup {store :: Store, addr :: Address}
 
+new_store :: StoreTup
+new_store = StoreTup (Map.empty) 0
+
 next_addr :: Address -> Address
 next_addr = (+ 1)
 
@@ -107,6 +166,9 @@ store_lookup :: Store -> Address -> HeapValue
 store_lookup s a = case Map.lookup a s of
     Nothing -> error ("No match for Address: " ++ (show a) ++ " in store: " ++ (show s))
     Just hv -> hv
+
+new_env :: Env
+new_env = Map.empty
 
 env_extend :: CoreBndr -> Value -> Env -> Env
 env_extend = Map.insert
@@ -143,10 +205,12 @@ data State
     = Return Value StoreTup [Kont]
     | Evaluate CoreExpr Env StoreTup [Kont]
 
--- TODO: Call this. Be careful of initial environment (needs to contain all top-level bindings).
-step :: State -> State
-step (Return v sto (k : ks)) = ret v sto ks k
-step (Evaluate c env sto ks) = eval env sto ks c
+data Result = Result Value StoreTup
+
+step :: State -> Either Result State
+step (Return v sto []) = Left (Result v sto)
+step (Return v sto (k : ks)) = Right (ret v sto ks k)
+step (Evaluate c env sto ks) = Right (eval env sto ks c)
 
 ret :: Value -> StoreTup -> [Kont] -> Kont -> State
 ret v sto ks k = case k of
@@ -262,8 +326,28 @@ evalType env (ForAllTy (Named tv vf) t) = ForAllTy (Named tv vf) (evalType (Map.
 evalType env (ForAllTy (Anon t1) t2) = ForAllTy (Anon (evalType env t1)) (evalType env t2)
 evalType env (LitTy tl) = LitTy tl
 evalType env (CastTy t kc) = CastTy (evalType env t) kc
-evalType env (CoercionTy co) = CoercionTy co
+evalType env (CoercionTy co) = CoercionTy (evalCoer env co)
 
--- TODO: Check that there are no expressions or types in here that need to be evaluated.
 evalCoer :: Env -> Coercion -> Coercion
-evalCoer e c = c
+evalCoer env (Refl r t) = Refl r (evalType env t)
+evalCoer env (TyConAppCo r tc cos) = TyConAppCo r tc (map (evalCoer env) cos)
+evalCoer env (AppCo co con) = AppCo (evalCoer env co) (evalCoer env con)
+evalCoer env (ForAllCo tv kco co) = ForAllCo tv (evalCoer env kco) (evalCoer (Map.delete tv env) co)
+evalCoer env (CoVarCo cv) = CoVarCo cv
+evalCoer env (AxiomInstCo cb bi cos) = AxiomInstCo cb bi (map (evalCoer env) cos)
+evalCoer env (UnivCo ucp r t1 t2) = UnivCo new_ucp r (evalType env t1) (evalType env t2) where
+    new_ucp = case ucp of
+        UnsafeCoerceProv -> UnsafeCoerceProv
+        PhantomProv kco -> PhantomProv (evalCoer env kco)
+        ProofIrrelProv kco -> ProofIrrelProv (evalCoer env kco)
+        PluginProv s -> PluginProv s
+        HoleProv cohole -> HoleProv cohole  -- Don't touch the funny IORef stuff.
+evalCoer env (SymCo co) = SymCo (evalCoer env co)
+evalCoer env (TransCo co1 co2) = TransCo (evalCoer env co1) (evalCoer env co2)
+evalCoer env (AxiomRuleCo car cos) = AxiomRuleCo car (map (evalCoer env) cos)  -- Cannot traverse `car` because functions are opaque.
+evalCoer env (NthCo i co) = NthCo i (evalCoer env co)
+evalCoer env (LRCo lor con) = LRCo lor (evalCoer env con)
+evalCoer env (InstCo co con) = InstCo (evalCoer env co) (evalCoer env con)
+evalCoer env (CoherenceCo co kco) = CoherenceCo (evalCoer env co) (evalCoer env kco)
+evalCoer env (KindCo co) = KindCo (evalCoer env co)
+evalCoer env (SubCo con) = SubCo (evalCoer env con)
