@@ -105,22 +105,22 @@ convertIntegers :: DynFlags -> Id -> Maybe DataCon -> ModGuts -> ModGuts
 convertIntegers dflags name mdc = modGuts where
     modGuts m = m { mg_binds = coreProgram (mg_binds m) }
     coreProgram = map coreBind
-    coreBind (NonRec x e) = NonRec x (exp e)
+    coreBind (NonRec x e) = NonRec x (expr e)
     coreBind (Rec bndrs) = Rec (map bndr bndrs)
-    bndr (x, e) = (x, exp e)
-    exp (Var x) = Var x
-    exp (Lit (LitInteger i t)) = cvtLitInteger dflags name mdc i
-    exp (Lit l) = Lit l
-    exp (App f a) = App (exp f) (exp a)
-    exp (Lam x body) = Lam x (exp body)
-    exp (Case e v t a) = Case (exp e) v t (alts a)
-    exp (Let b body) = Let (coreBind b) (exp body)
-    exp (Cast e co) = Cast (exp e) co
-    exp (Tick t e) = Tick t (exp e)
-    exp (Type ty) = Type ty
-    exp (Coercion co) = Coercion co
+    bndr (x, e) = (x, expr e)
+    expr (Var x) = Var x
+    expr (Lit (LitInteger i _)) = cvtLitInteger dflags name mdc i
+    expr (Lit l) = Lit l
+    expr (App f a) = App (expr f) (expr a)
+    expr (Lam x body) = Lam x (expr body)
+    expr (Case e v t a) = Case (expr e) v t (alts a)
+    expr (Let b body) = Let (coreBind b) (expr body)
+    expr (Cast e co) = Cast (expr e) co
+    expr (Tick t e) = Tick t (expr e)
+    expr (Type ty) = Type ty
+    expr (Coercion co) = Coercion co
     alts = map alt
-    alt (ac, bs, e) = (ac, bs, (exp e))
+    alt (ac, bs, e) = (ac, bs, (expr e))
 
 sDocToString :: Outputable a => a -> String
 sDocToString = showSDocUnsafe . ppr
@@ -223,7 +223,7 @@ ret v sto ks k = case k of
                         sto' = store_alloc (Thunk env arg) sto
                     _ -> error "Function position of application was not a closure."
             _ -> error "Function position of application was not a HeapValue."
-    CaseK env bndr ty alts
+    CaseK env bndr _ alts
         | HeapValue a <- v -> case (store_lookup (store sto) a) of
             Con dc vs -> last [g bs e | (ac, bs, e) <- alts, f ac] where
                 f :: AltCon -> Bool
@@ -324,17 +324,17 @@ evalType env (AppTy t1 t2) = AppTy (evalType env t1) (evalType env t2)
 evalType env (TyConApp tc kots) = TyConApp tc (map (evalType env) kots)
 evalType env (ForAllTy (Named tv vf) t) = ForAllTy (Named tv vf) (evalType (Map.delete tv env) t)
 evalType env (ForAllTy (Anon t1) t2) = ForAllTy (Anon (evalType env t1)) (evalType env t2)
-evalType env (LitTy tl) = LitTy tl
+evalType _   (LitTy tl) = LitTy tl
 evalType env (CastTy t kc) = CastTy (evalType env t) kc
 evalType env (CoercionTy co) = CoercionTy (evalCoer env co)
 
 evalCoer :: Env -> Coercion -> Coercion
 evalCoer env (Refl r t) = Refl r (evalType env t)
-evalCoer env (TyConAppCo r tc cos) = TyConAppCo r tc (map (evalCoer env) cos)
+evalCoer env (TyConAppCo r tc coers) = TyConAppCo r tc (map (evalCoer env) coers)
 evalCoer env (AppCo co con) = AppCo (evalCoer env co) (evalCoer env con)
 evalCoer env (ForAllCo tv kco co) = ForAllCo tv (evalCoer env kco) (evalCoer (Map.delete tv env) co)
-evalCoer env (CoVarCo cv) = CoVarCo cv
-evalCoer env (AxiomInstCo cb bi cos) = AxiomInstCo cb bi (map (evalCoer env) cos)
+evalCoer _   (CoVarCo cv) = CoVarCo cv
+evalCoer env (AxiomInstCo cb bi coers) = AxiomInstCo cb bi (map (evalCoer env) coers)
 evalCoer env (UnivCo ucp r t1 t2) = UnivCo new_ucp r (evalType env t1) (evalType env t2) where
     new_ucp = case ucp of
         UnsafeCoerceProv -> UnsafeCoerceProv
@@ -344,7 +344,7 @@ evalCoer env (UnivCo ucp r t1 t2) = UnivCo new_ucp r (evalType env t1) (evalType
         HoleProv cohole -> HoleProv cohole  -- Don't touch the funny IORef stuff.
 evalCoer env (SymCo co) = SymCo (evalCoer env co)
 evalCoer env (TransCo co1 co2) = TransCo (evalCoer env co1) (evalCoer env co2)
-evalCoer env (AxiomRuleCo car cos) = AxiomRuleCo car (map (evalCoer env) cos)  -- Cannot traverse `car` because functions are opaque.
+evalCoer env (AxiomRuleCo car coers) = AxiomRuleCo car (map (evalCoer env) coers)  -- Cannot traverse `car` because functions are opaque.
 evalCoer env (NthCo i co) = NthCo i (evalCoer env co)
 evalCoer env (LRCo lor con) = LRCo lor (evalCoer env con)
 evalCoer env (InstCo co con) = InstCo (evalCoer env co) (evalCoer env con)
