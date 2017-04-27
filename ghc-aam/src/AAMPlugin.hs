@@ -46,7 +46,7 @@ pass opts guts = do
     putMsgS "****************************************"
     putMsgS "Evaluating program"
     putMsgS "****************************************"
-    let ! results = map (interp sto) exprs
+    !results <- mapM (interp sto) exprs
     putMsgS "****************************************"
     putMsgS "Outputting results"
     putMsgS "****************************************"
@@ -88,18 +88,25 @@ getExprs (StoreTup s _) a = case store_lookup s a of
     Thunk env expr -> (env, expr)
     _ -> error "invalid value in store"
 
-interp :: StoreTup -> (Env, CoreExpr) -> Result
+interp :: StoreTup -> (Env, CoreExpr) -> CoreM Result
 interp s (env, e) = interp' (Right (Evaluate e env s []))
 
-interp' :: Either Result State -> Result
-interp' (Left res) = res
-interp' (Right s) = interp' (step s)
+interp' :: Either Result State -> CoreM Result
+interp' (Left res) = return res
+interp' (Right s) = do
+    putMsgS "****************************************"
+    putMsgS (stateToString s)
+    interp' (step s)
 
 resultToString :: Result -> String
 resultToString (Result v st) = "value: " ++ show v ++ "\n" ++ "store: " ++ storeToString st
 
 storeToString :: StoreTup -> String
 storeToString (StoreTup s a) = "next address: " ++ show a ++ "\n" ++ (unlines (map show (Map.toList s)))
+
+stateToString :: State -> String
+stateToString (Return v sto ks) = "Return: " ++ show v ++ "\n" ++ "konts: " ++ show ks ++ "\n" ++ "store: " ++ storeToString sto
+stateToString (Evaluate e env sto ks) = "Evaluate: " ++ show e ++ "\n" ++ "env: " ++ show env ++ "\n" ++ "konts: " ++ show ks ++ "\n" ++ "store: " ++ storeToString sto
 
 convertIntegers :: DynFlags -> Id -> Maybe DataCon -> ModGuts -> ModGuts
 convertIntegers dflags name mdc = modGuts where
@@ -125,24 +132,30 @@ convertIntegers dflags name mdc = modGuts where
 sDocToString :: Outputable a => a -> String
 sDocToString = showSDocUnsafe . ppr
 
-instance Show (CoreExpr) where
+instance Show CoreExpr where
     show = sDocToString
 
 instance Show CoreBndr where
     show = sDocToString
 
 instance Show DataCon where
-    show = error "No Show instance for DataCon."
+    show = sDocToString
+
+instance Show (Tickish Id) where
+    show = sDocToString
+
+instance Show Type where
+    show = sDocToString
+
+instance Show AltCon where
+    show = sDocToString
+
+instance Show Coercion where
+    show = sDocToString
 
 type Address = Int
 
 type Env = Map.Map CoreBndr Value
-
-data HeapValue
-    = Clo Env CoreBndr CoreExpr
-    | Con DataCon [Value]
-    | Thunk Env CoreExpr
-    deriving (Show)
 
 --instance (Outputable a) => Show a where
 --    show = showSDocUnsafe . ppr
@@ -167,6 +180,9 @@ store_lookup s a = case Map.lookup a s of
     Nothing -> error ("No match for Address: " ++ (show a) ++ " in store: " ++ (show s))
     Just hv -> hv
 
+store_set :: Address -> HeapValue -> StoreTup -> StoreTup
+store_set a hv sto = sto {store = Map.insert a hv (store sto)}
+
 new_env :: Env
 new_env = Map.empty
 
@@ -188,6 +204,12 @@ data Value
     | TypeValue Type
     | CoerceValue Coercion
 
+data HeapValue
+    = Clo Env CoreBndr CoreExpr
+    | Con DataCon [Value]
+    | Thunk Env CoreExpr
+    deriving (Show)
+
 instance Show Value where
     show (HeapValue a) = "HeapValue: " ++ (show a)
     show (ImValue l) = "ImValue: " ++ (sDocToString l)
@@ -196,10 +218,13 @@ instance Show Value where
     show (CoerceValue co) = "Coercion: " ++ (sDocToString co)
 
 data Kont
-    = App1K Env CoreExpr
+    = VarK Address
+    | AppK Value
+    | UnliftedAppK Env CoreExpr
     | CaseK Env CoreBndr Type [CoreAlt]
     | CastK Coercion
     | TickK (Tickish Id)
+    deriving (Show)
 
 data State
     = Return Value StoreTup [Kont]
@@ -214,15 +239,19 @@ step (Evaluate c env sto ks) = Right (eval env sto ks c)
 
 ret :: Value -> StoreTup -> [Kont] -> Kont -> State
 ret v sto ks k = case k of
-    App1K env arg ->
+    VarK a -> case v of
+        HeapValue a' -> Return (HeapValue a) (store_set a (store_lookup (store sto) a') sto) ks
+        _ -> error "VarK value not an address."
+    AppK arg ->
         case v of
             HeapValue a ->
                  case (store_lookup (store sto) a) of
-                    (Clo clo_env name body) -> Evaluate body env' sto' ks where
-                        env' = env_extend name (HeapValue (addr sto)) clo_env
-                        sto' = store_alloc (Thunk env arg) sto
-                    _ -> error "Function position of application was not a closure."
+                    Clo clo_env name body -> Evaluate body (env_extend name arg clo_env) sto ks  -- TODO: Is the environment extension correct?
+                    Con dc vs -> Return (HeapValue (addr sto)) sto' ks where
+                        sto' = store_alloc (Con dc (vs ++ [arg])) sto
+                    _ -> error "Function position of application was not a closure or data constructor."
             _ -> error "Function position of application was not a HeapValue."
+    UnliftedAppK env fun -> Evaluate fun env sto (AppK v : ks)
     CaseK env bndr _ alts
         | HeapValue a <- v -> case (store_lookup (store sto) a) of
             Con dc vs -> last [g bs e | (ac, bs, e) <- alts, f ac] where
@@ -268,14 +297,22 @@ ret v sto ks k = case k of
 eval :: Env -> StoreTup -> [Kont] -> CoreExpr -> State
 eval env sto ks c = case c of
     Var x ->
-        -- Look up the variable in the current environment.
-        Return (env_lookup env x) sto ks
+        case idDetails x of
+            DataConWorkId dc -> Return (HeapValue (addr sto)) (store_alloc (Con dc []) sto) ks
+            DataConWrapId dc -> Return (HeapValue (addr sto)) (store_alloc (Con dc []) sto) ks
+            -- Look up the variable in the current environment.
+            _ -> case (env_lookup env x) of
+                HeapValue a -> case (store_lookup (store sto) a) of
+                    Thunk env' e -> Evaluate e env' sto (VarK a : ks)
+                    _ -> Return (HeapValue a) sto ks
+                v -> Return v sto ks
     Lit l ->
         -- We assume there are no non-immediate literals.
         Return (ImValue l) sto ks
-    App f a ->
-        -- Wrap application in a Thunk; evaluate function.
-        Evaluate f env sto (App1K env a : ks)
+    App f a | isUnliftedType (exprType a) -> Evaluate a env sto (UnliftedAppK env f : ks)
+            | otherwise -> Evaluate f env sto' (AppK arg : ks) where
+                arg = HeapValue (addr sto)
+                sto' = store_alloc (Thunk env a) sto
     Lam x body ->
         -- Create a closure.
         Return (HeapValue (addr sto)) (store_alloc (Clo env x body) sto) ks
